@@ -1,0 +1,55 @@
+
+# ICKAB - Python y Odoo
+
+# Cache de Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+ENV/
+
+# Archivos temporales
+*.tmp
+*.temp
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Archivos de desarrollo
+.vscode/
+.idea/
+.coverage
+htmlcov/
+
+# Variables y credenciales
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Registros
+*.log
+logs/
+
+# Respaldos y bases de datos
+*.dump
+*.backup
+*.sql
+*.sql.gz
+
+# Paquetes generados
+dist/
+build/
+*.zip
+*.tar.gz
