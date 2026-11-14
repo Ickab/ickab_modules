@@ -1,932 +1,622 @@
 #!/usr/bin/env bash
-# ICKAB Module Manager v2.2.0
-# Odoo 18 - Instalacion y actualizacion de modulos
 set -Eeuo pipefail
 umask 077
 
-VERSION_MANAGER="2.2.1"
-
-BASE="${ICKAB_ODOO_BASE:-/opt/odoo18}"
-REPO="${ICKAB_GITHUB_REPO:-Ickab/ickab_modules}"
-BRANCH="${ICKAB_GITHUB_BRANCH:-main}"
-SOURCE_INSTANCE="${ICKAB_SOURCE_INSTANCE:-demo}"
-BACKUP_ROOT="${ICKAB_BACKUP_ROOT:-/opt/odoo18/module-backups}"
-LOG_ROOT="${ICKAB_LOG_ROOT:-/var/log/ickab-updates}"
-
-INSTANCE=""
-MODULE=""
-MODE=""
-VERSION=""
-INSTALLED_VERSION=""
-DISK_VERSION=""
-DB=""
-CFG=""
-SERVICE=""
-USERNAME=""
-USERGROUP=""
-DEST=""
-SRC=""
+ROOT="/var/backups/ickab-module-manager"
+REPO="Ickab/ickab_modules"
 WORK=""
-LOG=""
-ODOO_LOG=""
-ACTION=""
-SERVICE_STOPPED=0
-CHANGES_STARTED=0
-LOCK_FD=""
-BACKUP_DIR=""
+SERVICE=""
+BACKUP=""
+STOPPED=0
 
 die() {
     printf '\nERROR: %s\n' "$*" >&2
     exit 1
 }
 
-say() {
-    printf '%s\n' "$*"
+confirm() {
+    local answer
+    read -r -p "$1 [escribe SI]: " answer || die "Cancelado"
+    [[ "$answer" == SI ]] || die "Cancelado"
+}
+
+choose() {
+    local answer
+    while true; do
+        read -r -p "$1 [1-$2]: " answer || die "Cancelado"
+        if [[ "$answer" =~ ^[0-9]+$ ]] &&
+           (( 10#$answer >= 1 && 10#$answer <= $2 )); then
+            REPLY=$((10#$answer))
+            return
+        fi
+        echo "Opcion invalida"
+    done
 }
 
 cleanup() {
     local rc=$?
     trap - EXIT
-
-    if (( rc != 0 && SERVICE_STOPPED )); then
-        if (( CHANGES_STARTED == 0 )); then
-            say ""
-            say "Intentando restablecer $SERVICE..."
-
-            if systemctl start "$SERVICE" &&
-               systemctl is-active --quiet "$SERVICE"; then
-                say "Servicio restablecido."
-                SERVICE_STOPPED=0
-            else
-                say "ALERTA: No se pudo restablecer $SERVICE."
-            fi
-        else
-            say ""
-            say "ALERTA: La operacion no termino correctamente."
-            say "El codigo o la base de datos pudieron cambiar."
-            say "No se intentara una restauracion automatica."
-            say "Revisar logs y respaldos antes de intervenir."
-        fi
+    if (( STOPPED )); then
+        echo "ATENCION: $SERVICE permanece detenido." >&2
+        echo "Respaldo: $BACKUP" >&2
     fi
-
-    if [[ -n "$WORK" && -d "$WORK" ]]; then
-        rm -rf -- "$WORK"
-    fi
-
+    [[ -z "$WORK" ]] || rm -rf -- "$WORK"
     exit "$rc"
 }
-
 trap cleanup EXIT
-trap 'echo "Fallo en linea $LINENO: $BASH_COMMAND" >&2' ERR
 
-ask_sn() {
-    local prompt="$1"
-    local answer
+[[ "$EUID" -eq 0 ]] || die "Ejecutar con sudo"
 
-    while true; do
-        read -r -p "$prompt [S/N]: " answer ||
-            die "Entrada interrumpida"
+for cmd in python3 systemctl runuser psql pg_dump tar flock curl sha256sum; do
+    command -v "$cmd" >/dev/null || die "Falta dependencia: $cmd"
+done
 
-        case "${answer^^}" in
-            S|N)
-                REPLY="${answer^^}"
-                return 0
-                ;;
-        esac
-
-        say "Escribe S o N."
-    done
-}
-
-ask_name() {
-    local prompt="$1"
-    local answer
-
-    while true; do
-        read -r -p "$prompt: " answer ||
-            die "Entrada interrumpida"
-
-        if [[ "$answer" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
-            REPLY="$answer"
-            return 0
-        fi
-
-        say "Utiliza el nombre tecnico, sin espacios."
-    done
-}
-
-config_value() {
-    python3 - "$CFG" "$1" <<'PY'
-import configparser
-import sys
-
-cfg = configparser.ConfigParser(
-    interpolation=None,
-    strict=False
+parse_unit() {
+    python3 - "$1" <<'PY'
+import re, shlex, sys
+s = sys.argv[1]
+m = re.search(
+    r'argv\[\]=(.*?)(?:\s;\s(?:ignore_errors|start_time|stop_time|pid)=|\s*\})',
+    s
 )
+if not m:
+    sys.exit(1)
+a = shlex.split(m.group(1))
+b = next((i for i, x in enumerate(a) if x.endswith('/odoo-bin')), None)
+if b is None:
+    sys.exit(1)
+cfg = ''
+for i, x in enumerate(a):
+    if x in ('-c', '--config') and i + 1 < len(a):
+        cfg = a[i + 1]
+    elif x.startswith('--config='):
+        cfg = x.split('=', 1)[1]
+print(a[b])
+print(cfg)
+print(a[b-1] if b and a[b-1].startswith('/') else '')
+PY
+}
 
-if not cfg.read(sys.argv[1]):
-    raise SystemExit("No se pudo leer configuracion")
-
-print(cfg.get(
-    "options",
-    sys.argv[2],
-    fallback=""
-).strip())
+conf() {
+    python3 - "$1" "$2" <<'PY'
+import configparser, sys
+p = configparser.ConfigParser(interpolation=None, strict=False)
+if not p.read(sys.argv[1]):
+    sys.exit(1)
+print(p.get('options', sys.argv[2], fallback='').strip())
 PY
 }
 
 manifest_version() {
     python3 - "$1" <<'PY'
-import ast
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as f:
+import ast, sys
+with open(sys.argv[1], encoding='utf8') as f:
     data = ast.literal_eval(f.read())
-
-if not isinstance(data, dict):
-    raise SystemExit("Manifiesto invalido")
-
-version = str(data.get("version", ""))
-
-if not version:
-    raise SystemExit("Manifiesto sin version")
-
-print(version)
+print(data.get('version', ''))
 PY
 }
 
-validate_version() {
-    python3 - "$1" <<'PY'
-import re
-import sys
+echo
+echo "=========================================================="
+echo "              ICKAB MODULE MANAGER 1.0"
+echo "=========================================================="
+echo "Detectando instancias Odoo..."
 
-v = sys.argv[1]
+declare -a UNITS=() CONFIGS=() BINS=() PYS=() OWNERS=() STATES=()
 
-if not re.fullmatch(r"18\.0(?:\.\d+)+", v):
-    raise SystemExit("Version incompatible con Odoo 18: " + v)
+while IFS= read -r unit; do
+    [[ "$unit" == *odoo*.service ]] || continue
+
+    raw=$(systemctl show "$unit" -p ExecStart --value 2>/dev/null || true)
+    [[ "$raw" == *odoo-bin* ]] || continue
+
+    mapfile -t parts < <(parse_unit "$raw" 2>/dev/null || true)
+    ((${#parts[@]} == 3)) || continue
+
+    [[ -f "${parts[0]}" && -f "${parts[1]}" ]] || continue
+
+    owner=$(systemctl show "$unit" -p User --value)
+    [[ -n "$owner" && "$owner" != root ]] || continue
+
+    UNITS+=("$unit")
+    CONFIGS+=("${parts[1]}")
+    BINS+=("${parts[0]}")
+    PYS+=("${parts[2]}")
+    OWNERS+=("$owner")
+    STATES+=("$(systemctl is-active "$unit" || true)")
+done < <(
+    systemctl list-unit-files --type=service --no-legend --no-pager |
+    awk '{print $1}' | sort -u
+)
+
+((${#UNITS[@]} > 0)) || die "No se encontraron instancias compatibles"
+
+echo
+printf '%-4s %-42s %-12s\n' "N" "SERVICIO" "ESTADO"
+echo "------------------------------------------------------------"
+
+for i in "${!UNITS[@]}"; do
+    printf '%-4s %-42s %-12s\n' \
+        "$((i+1))" "${UNITS[i]}" "${STATES[i]}"
+done
+
+echo
+choose "Selecciona la instancia" "${#UNITS[@]}"
+i=$((REPLY-1))
+
+SERVICE="${UNITS[i]}"
+CFG="${CONFIGS[i]}"
+BIN="${BINS[i]}"
+PY="${PYS[i]}"
+OWNER="${OWNERS[i]}"
+STATE="${STATES[i]}"
+
+[[ -x "$PY" ]] || PY=$(command -v python3)
+
+[[ "$STATE" == active || "$STATE" == inactive ]] ||
+    die "Estado de servicio no permitido: $STATE"
+
+VER=$(
+    python3 - "$BIN" <<'PY'
+import pathlib, re, sys
+root = pathlib.Path(sys.argv[1]).resolve().parent
+file = root / 'odoo' / 'release.py'
+if file.exists():
+    text = file.read_text(errors='replace')
+    m = re.search(
+        r'^version_info\s*=\s*\((\d+)\s*,\s*(\d+)',
+        text, re.M
+    )
+    if m:
+        print(f'{m.group(1)}.{m.group(2)}')
 PY
-}
+)
 
-compare_versions() {
-    python3 - "$VERSION" "$INSTALLED_VERSION" "$DISK_VERSION" <<'PY'
-import re
-import sys
+[[ "$VER" =~ ^[0-9]+\.[0-9]+$ ]] ||
+    die "No se pudo identificar la version real de Odoo"
 
-new, installed, disk = sys.argv[1:]
+DBNAME=$(conf "$CFG" db_name)
+DBFILTER=$(conf "$CFG" dbfilter)
+HOST=$(conf "$CFG" db_host)
+PORT=$(conf "$CFG" db_port)
+PGUSER=$(conf "$CFG" db_user)
+PASS=$(conf "$CFG" db_password)
 
-def parse(v):
-    if not re.fullmatch(r"18\.0(?:\.\d+)+", v):
-        return None
-    return tuple(map(int, v.split(".")))
+PG=()
+[[ -z "$HOST" || "${HOST,,}" == false ]] || PG+=(-h "$HOST")
+[[ -z "$PORT" || "${PORT,,}" == false ]] || PG+=(-p "$PORT")
+[[ -z "$PGUSER" || "${PGUSER,,}" == false ]] || PG+=(-U "$PGUSER")
 
-def normalized(v, length):
-    return v + (0,) * (length - len(v))
+export PGPASSWORD=""
+[[ -z "$PASS" || "${PASS,,}" == false ]] || PGPASSWORD="$PASS"
 
-new_v = parse(new)
+mapfile -t DBS < <(
+    runuser -u "$OWNER" -- env PGPASSWORD="$PGPASSWORD" \
+        psql -X "${PG[@]}" -d postgres -Atqc \
+        "SELECT datname FROM pg_database
+         WHERE datallowconn AND NOT datistemplate
+         ORDER BY datname" 2>/dev/null || true
+)
 
-if new_v is None:
-    raise SystemExit("Version nueva invalida")
+((${#DBS[@]} > 0)) ||
+    die "No se pudieron consultar bases PostgreSQL"
 
-for label, current in (
-    ("base de datos", installed),
-    ("directorio del modulo", disk),
-):
-    old_v = parse(current)
+if [[ -n "$DBNAME" && "${DBNAME,,}" != false ]]; then
+    IFS=',' read -r -a REQUESTED <<< "$DBNAME"
+else
+    REQUESTED=()
+fi
 
-    if old_v is None:
-        if current and current not in ("No existe",):
-            print(
-                "ADVERTENCIA: No se pudo comparar "
-                f"la version de {label}: {current}"
-            )
-        continue
+declare -a VALID=()
 
-    size = max(len(new_v), len(old_v))
+for db in "${DBS[@]}"; do
+    [[ "$db" =~ ^[A-Za-z0-9_]+$ ]] || continue
 
-    if normalized(new_v, size) < normalized(old_v, size):
-        raise SystemExit(
-            f"Actualizacion descendente bloqueada: "
-            f"{label}={current}, nueva={new}"
-        )
-
-print("Comparacion de versiones: OK")
-PY
-}
-
-check_dependencies() {
-    local cmd
-
-    for cmd in \
-        python3 curl rsync tar pg_dump pg_restore \
-        psql systemctl flock sudo sha256sum \
-        realpath tee mktemp find grep getent
-    do
-        command -v "$cmd" >/dev/null 2>&1 ||
-            die "Dependencia faltante: $cmd"
-    done
-}
-
-
-detect_database() {
-    local named filter exists
-
-    named="$(config_value db_name)"
-    filter="$(config_value dbfilter)"
-
-    if [[ "$named" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-        DB="$named"
-    elif [[ "$filter" =~ ^\^([a-zA-Z0-9_-]+)\$$ ]]; then
-        DB="${BASH_REMATCH[1]}"
-    else
-        die "No se identificó una base de datos única"
+    if ((${#REQUESTED[@]})); then
+        found=0
+        for candidate in "${REQUESTED[@]}"; do
+            [[ "$candidate" == "$db" ]] && found=1
+        done
+        ((found)) || continue
     fi
 
-    exists="$(sudo -u postgres psql -X -At \
-        -v db="$DB" postgres <<'SQL'
-SELECT 1 FROM pg_database WHERE datname = :'db';
-SQL
-)" || die "Falló la consulta PostgreSQL"
+    check=$(
+        runuser -u "$OWNER" -- env PGPASSWORD="$PGPASSWORD" \
+            psql -X "${PG[@]}" -d "$db" -Atqc \
+            "SELECT to_regclass('public.ir_module_module') IS NOT NULL" \
+            2>/dev/null || true
+    )
 
-    [[ "$exists" == 1 ]] ||
-        die "La base de datos $DB no existe"
-}
+    [[ "$check" == t ]] && VALID+=("$db")
+done
 
+((${#VALID[@]} > 0)) || die "No se encontraron bases Odoo accesibles"
 
-check_paths() {
-    local addons path found=0
-    local -a paths
+echo
+echo "Servicio: $SERVICE"
+echo "Version Odoo: $VER"
+echo "Estado: $STATE"
+echo "Configuracion: $CFG"
+echo "Filtro de base: ${DBFILTER:-no definido}"
+echo
+echo "BASES DE DATOS DISPONIBLES"
 
-    addons="$(config_value addons_path)"
+for i in "${!VALID[@]}"; do
+    printf '%d) %s\n' "$((i+1))" "${VALID[i]}"
+done
 
-    [[ -n "$addons" ]] ||
-        die "addons_path no configurado"
+choose "Selecciona la base de datos" "${#VALID[@]}"
+DB="${VALID[REPLY-1]}"
 
-    DEST="$BASE/$INSTANCE/extra-addons/extras/$MODULE"
+confirm "Confirmas servicio $SERVICE y base $DB?"
 
-    [[ -d "$(dirname "$DEST")" ]] ||
-        die "No existe extra-addons/extras en la instancia"
+echo
+read -r -p "Nombre tecnico del modulo: " MODULE
 
-    [[ ! -L "$DEST" ]] ||
-        die "Destino simbólico no permitido"
+[[ "$MODULE" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] ||
+    die "Nombre tecnico invalido"
 
-    IFS=',' read -ra paths <<< "$addons"
+CURRENT_STATE=$(
+    runuser -u "$OWNER" -- env PGPASSWORD="$PGPASSWORD" \
+        psql -X "${PG[@]}" -d "$DB" -Atqc \
+        "SELECT state FROM ir_module_module
+         WHERE name='$MODULE' LIMIT 1" 2>/dev/null
+) || die "No se pudo consultar el estado del modulo"
 
-    for path in "${paths[@]}"; do
+if [[ "$CURRENT_STATE" == installed ]]; then
+    ACTION="update"
+    echo "Operacion: ACTUALIZAR"
+elif [[ -z "$CURRENT_STATE" || "$CURRENT_STATE" == uninstalled ]]; then
+    ACTION="install"
+    echo "Operacion: INSTALAR"
+else
+    die "Estado del modulo incompatible: $CURRENT_STATE"
+fi
+
+WORK=$(mktemp -d /tmp/ickab-module.XXXXXXXX)
+
+echo
+echo "ORIGEN DEL MODULO"
+echo "1) GitHub ICKAB"
+echo "2) Carpeta local"
+choose "Selecciona el origen" 2
+
+if ((REPLY == 1)); then
+    curl -fsSL --max-time 60 \
+        "https://api.github.com/repos/$REPO/contents/$VER?ref=main" \
+        -o "$WORK/index.json" ||
+        die "No se pudo consultar GitHub"
+
+    mapfile -t PACKAGES < <(
+        python3 - "$WORK/index.json" "$MODULE" "$VER" <<'PY'
+import json, re, sys
+with open(sys.argv[1], encoding='utf8') as f:
+    items = json.load(f)
+pattern = re.compile(
+    re.escape(sys.argv[2]) + '_' +
+    re.escape(sys.argv[3]) +
+    r'\.[0-9]+(?:\.[0-9]+)*\.zip'
+)
+if isinstance(items, list):
+    for item in items:
+        name = item.get('name', '')
+        if item.get('type') == 'file' and pattern.fullmatch(name):
+            print(name)
+PY
+    )
+
+    ((${#PACKAGES[@]} > 0)) ||
+        die "No existen paquetes compatibles en GitHub"
+
+    for i in "${!PACKAGES[@]}"; do
+        printf '%d) %s\n' "$((i+1))" "${PACKAGES[i]}"
+    done
+
+    choose "Selecciona el paquete" "${#PACKAGES[@]}"
+    ZIP="${PACKAGES[REPLY-1]}"
+
+    curl -fLsS --max-time 300 \
+        "https://raw.githubusercontent.com/$REPO/main/$VER/$ZIP" \
+        -o "$WORK/module.zip" ||
+        die "Error descargando el paquete"
+
+    python3 - "$WORK/module.zip" "$WORK/source" "$MODULE" <<'PY'
+import os, stat, sys, zipfile
+archive, dest, module = sys.argv[1:]
+with zipfile.ZipFile(archive) as z:
+    entries = z.infolist()
+    if not entries or len(entries) > 10000:
+        sys.exit('ZIP invalido')
+    if sum(e.file_size for e in entries) > 500 * 1024 * 1024:
+        sys.exit('ZIP demasiado grande')
+    for e in entries:
+        name = e.filename
+        parts = name.rstrip('/').split('/')
+        kind = (e.external_attr >> 16) & 0o170000
+        if (
+            name.startswith('/') or
+            '\\' in name or
+            any(p in ('', '.', '..') for p in parts) or
+            parts[0] != module or
+            kind not in (0, stat.S_IFREG, stat.S_IFDIR)
+        ):
+            sys.exit('ZIP inseguro')
+    os.mkdir(dest)
+    z.extractall(dest)
+PY
+
+    SOURCE="$WORK/source/$MODULE"
+else
+    read -r -p "Ruta absoluta del modulo: " SOURCE
+    [[ "$SOURCE" == /* && -d "$SOURCE" ]] ||
+        die "Ruta local invalida"
+    SOURCE=$(realpath "$SOURCE")
+fi
+
+[[ -f "$SOURCE/__manifest__.py" ]] ||
+    die "No existe __manifest__.py"
+
+[[ -z "$(find "$SOURCE" -type l -print -quit)" ]] ||
+    die "El paquete contiene enlaces simbolicos"
+
+NEW=$(manifest_version "$SOURCE/__manifest__.py") ||
+    die "Manifiesto invalido"
+
+[[ "$NEW" == "$VER."* ]] ||
+    die "Version $NEW incompatible con Odoo $VER"
+
+ADDONS=$(conf "$CFG" addons_path)
+IFS=',' read -r -a PATHS <<< "$ADDONS"
+
+declare -a EXIST=() CUSTOM=()
+
+for path in "${PATHS[@]}"; do
+    path="${path#"${path%%[![:space:]]*}"}"
+    path="${path%"${path##*[![:space:]]}"}"
+
+    [[ -d "$path" ]] || continue
+
+    [[ -d "$path/$MODULE" ]] && EXIST+=("$path/$MODULE")
+
+    if [[ "$path" != */odoo/addons &&
+          "$path" != */enterprise ]]; then
+        CUSTOM+=("$path")
+    fi
+done
+
+if [[ "$ACTION" == update ]]; then
+    ((${#EXIST[@]} == 1)) ||
+        die "No se encontro una unica carpeta del modulo"
+
+    DEST="${EXIST[0]}"
+    OLDVER=$(manifest_version "$DEST/__manifest__.py") ||
+        die "Manifiesto anterior invalido"
+
+    [[ "$NEW" != "$OLDVER" ]] ||
+        die "La version ya esta instalada"
+
+    lowest=$(
+        printf '%s\n%s\n' "$OLDVER" "$NEW" |
+        sort -V | head -n 1
+    )
+
+    [[ "$lowest" == "$OLDVER" ]] ||
+        die "Retroceso de version bloqueado"
+else
+    ((${#EXIST[@]} == 0)) ||
+        die "Ya existe codigo del modulo; revisar antes de instalar"
+
+    ((${#CUSTOM[@]} > 0)) ||
+        die "No hay directorio de addons personalizados"
+
+    echo
+    echo "DIRECTORIOS DE INSTALACION"
+
+    for i in "${!CUSTOM[@]}"; do
+        printf '%d) %s\n' "$((i+1))" "${CUSTOM[i]}"
+    done
+
+    choose "Selecciona directorio" "${#CUSTOM[@]}"
+    DEST="${CUSTOM[REPLY-1]}/$MODULE"
+    OLDVER="no instalado"
+fi
+
+[[ ! -L "$DEST" ]] || die "Destino simbolico no permitido"
+
+declare -a SHARED=()
+
+while IFS= read -r other; do
+    [[ "$other" == "$SERVICE" || "$other" != *odoo*.service ]] &&
+        continue
+
+    raw=$(systemctl show "$other" -p ExecStart --value 2>/dev/null || true)
+    mapfile -t op < <(parse_unit "$raw" 2>/dev/null || true)
+
+    ((${#op[@]} == 3)) || continue
+    [[ -f "${op[1]}" ]] || continue
+
+    otherpaths=$(conf "${op[1]}" addons_path 2>/dev/null || true)
+    IFS=',' read -r -a OTHER_PATHS <<< "$otherpaths"
+
+    for path in "${OTHER_PATHS[@]}"; do
         path="${path#"${path%%[![:space:]]*}"}"
         path="${path%"${path##*[![:space:]]}"}"
 
-        [[ -n "$path" ]] || continue
-
-        if [[ "$(realpath -m "$path")" == \
-              "$(realpath -m "$(dirname "$DEST")")" ]]; then
-            found=1
-        fi
-
-        if [[ "$(realpath -m "$path")" != \
-              "$(realpath -m "$(dirname "$DEST")")" &&
-              -f "$path/$MODULE/__manifest__.py" ]]; then
-            die "Módulo duplicado en addons_path: $path/$MODULE"
-        fi
+        [[ "$DEST" == "$path/$MODULE" ]] && SHARED+=("$other")
     done
-
-    (( found )) ||
-        die "La carpeta extras no está declarada en addons_path"
-}
-
-check_service() {
-    local service_cfg
-
-    SERVICE="odoo18-$INSTANCE.service"
-
-    systemctl cat "$SERVICE" >/dev/null 2>&1 ||
-        die "Servicio inexistente: $SERVICE"
-
-    USERNAME="$(systemctl show -p User --value "$SERVICE")"
-
-    [[ -n "$USERNAME" && "$USERNAME" != root ]] ||
-        die "El servicio debe declarar un usuario no privilegiado"
-
-    id "$USERNAME" >/dev/null 2>&1 ||
-        die "Usuario del servicio inexistente"
-
-    USERGROUP="$(id -gn "$USERNAME")"
-
-    [[ -x "$BASE/$INSTANCE/venv/bin/python" ]] ||
-        die "No existe Python de la instancia"
-
-    [[ -f "$BASE/odoo/odoo-bin" ]] ||
-        die "No existe odoo-bin"
-
-    service_cfg="$(systemctl show -p ExecStart --value "$SERVICE")"
-
-    [[ "$service_cfg" == *"$CFG"* ]] ||
-        die "El servicio no referencia la configuracion esperada"
-
-    systemctl is-active --quiet "$SERVICE" ||
-        die "El servicio debe estar activo antes de comenzar"
-}
-
-get_module_state() {
-    local result
-
-    result="$(sudo -u postgres psql -X -At \
-        -v module="$MODULE" "$DB" <<'SQL'
-SELECT COALESCE(
-    (SELECT state || '|' || COALESCE(latest_version, '')
-     FROM ir_module_module
-     WHERE name = :'module'
-     LIMIT 1),
-    'uninstalled|'
-);
-SQL
-)" || die "No se pudo consultar el modulo en PostgreSQL"
-
-    local state="${result%%|*}"
-    INSTALLED_VERSION="${result#*|}"
-
-    case "$state" in
-        installed)
-            ACTION="ACTUALIZAR"
-            ;;
-        uninstalled)
-            ACTION="INSTALAR"
-            ;;
-        *)
-            die "Estado del modulo no permitido: $state"
-            ;;
-    esac
-}
-
-validate_source() {
-    [[ -d "$SRC" ]] ||
-        die "Directorio fuente inexistente: $SRC"
-
-    [[ -f "$SRC/__manifest__.py" ]] ||
-        die "El paquete no contiene __manifest__.py"
-
-    if [[ -n "$(find "$SRC" -type l -print -quit)" ]]; then
-        die "No se permiten enlaces simbolicos en el modulo"
-    fi
-
-    local actual
-
-    actual="$(manifest_version "$SRC/__manifest__.py")" ||
-        die "Manifiesto invalido"
-
-    validate_version "$actual" ||
-        die "Version no compatible"
-
-    if [[ -n "$VERSION" && "$actual" != "$VERSION" ]]; then
-        die "La version del manifiesto no coincide con el ZIP"
-    fi
-
-    VERSION="$actual"
-}
-
-github_download() {
-    local api="$WORK/github.json"
-    local selected="$WORK/selected.txt"
-    local url gitsha actual
-    local -a result
-
-    say "Consultando repositorio GitHub..."
-
-    curl -fsSL \
-        --retry 2 \
-        --connect-timeout 15 \
-        --max-time 90 \
-        -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/$REPO/contents/18.0?ref=$BRANCH" \
-        -o "$api" ||
-        die "No se pudo consultar GitHub"
-
-    python3 - "$api" "$MODULE" "$selected" <<'PY'
-import json
-import re
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as f:
-    items = json.load(f)
-
-if not isinstance(items, list):
-    raise SystemExit("Respuesta inesperada de GitHub")
-
-module = sys.argv[2]
-candidates = []
-
-for item in items:
-    if item.get("type") != "file":
-        continue
-
-    match = re.fullmatch(
-        re.escape(module) + r"_(18\.0(?:\.\d+)+)\.zip",
-        item.get("name", "")
-    )
-
-    if not match:
-        continue
-
-    version = match.group(1)
-    key = tuple(map(int, version.split(".")))
-    candidates.append((key, version, item))
-
-if not candidates:
-    raise SystemExit("No existe paquete para " + module)
-
-_, version, item = max(candidates, key=lambda x: x[0])
-
-url = item.get("download_url")
-sha = item.get("sha")
-
-if not url or not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
-    raise SystemExit("Metadatos incompletos")
-
-if not url.startswith(
-    "https://raw.githubusercontent.com/"
-):
-    raise SystemExit("URL de descarga inesperada")
-
-with open(sys.argv[3], "w", encoding="utf-8") as f:
-    f.write(version + "\n")
-    f.write(url + "\n")
-    f.write(sha + "\n")
-PY
-
-    mapfile -t result < "$selected"
-
-    VERSION="${result[0]}"
-    url="${result[1]}"
-    gitsha="${result[2]}"
-
-    say "Version publicada: $VERSION"
-    say "Descargando ZIP..."
-
-    curl -fsSL \
-        --retry 2 \
-        --connect-timeout 15 \
-        --max-time 300 \
-        "$url" \
-        -o "$WORK/module.zip" ||
-        die "Error al descargar ZIP"
-
-    say "Validando integridad de GitHub..."
-
-    python3 - "$WORK/module.zip" "$gitsha" <<'PY'
-import hashlib
-import sys
-
-with open(sys.argv[1], "rb") as f:
-    content = f.read()
-
-header = b"blob " + str(len(content)).encode() + b"\0"
-actual = hashlib.sha1(header + content).hexdigest()
-
-if actual != sys.argv[2]:
-    raise SystemExit("Hash de GitHub no coincide")
-
-print("Integridad del objeto Git: OK")
-PY
-
-    SRC="$WORK/extracted"
-    mkdir -p "$SRC"
-
-    say "Validando y extrayendo ZIP..."
-
-    python3 - "$WORK/module.zip" "$SRC" "$MODULE" <<'PY'
-import pathlib
-import shutil
-import stat
-import sys
-import zipfile
-
-archive, destination, module = sys.argv[1:]
-
-with zipfile.ZipFile(archive) as z:
-    entries = z.infolist()
-
-    if not entries or len(entries) > 20000:
-        raise SystemExit("Cantidad de archivos no permitida")
-
-    if sum(i.file_size for i in entries) > 1024**3:
-        raise SystemExit("Tamano descomprimido excesivo")
-
-    if z.testzip() is not None:
-        raise SystemExit("ZIP corrupto")
-
-    names = set()
-    paths = []
-
-    for item in entries:
-        name = item.filename
-        path = pathlib.PurePosixPath(name)
-
-        if (
-            not name
-            or name.startswith("/")
-            or "\\" in name
-            or ":" in name
-            or ".." in path.parts
-            or item.flag_bits & 1
-        ):
-            raise SystemExit("Entrada ZIP insegura")
-
-        if str(path) in names:
-            raise SystemExit("Archivo duplicado en ZIP")
-
-        names.add(str(path))
-
-        mode = item.external_attr >> 16
-        kind = stat.S_IFMT(mode)
-
-        if kind not in (0, stat.S_IFREG, stat.S_IFDIR):
-            raise SystemExit("Tipo de archivo no permitido")
-
-        paths.append(path)
-
-    wrapped = all(
-        p.parts and p.parts[0] == module
-        for p in paths
-    )
-
-    for item, path in zip(entries, paths):
-        parts = path.parts[1:] if wrapped else path.parts
-
-        if not parts:
-            continue
-
-        target = pathlib.Path(destination).joinpath(*parts)
-
-        if item.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-            continue
-
-        target.parent.mkdir(parents=True, exist_ok=True)
-
-        with z.open(item) as source:
-            with open(target, "wb") as output:
-                shutil.copyfileobj(source, output)
-
-manifest = pathlib.Path(destination) / "__manifest__.py"
-
-if not manifest.is_file():
-    raise SystemExit("No se encontro __manifest__.py")
-
-print("Extraccion segura: OK")
-PY
-
-    validate_source
-}
-
-
-local_source() {
-    local first second
-
-    first="$BASE/$SOURCE_INSTANCE/extra-addons/extras/$MODULE"
-    second="$BASE/$SOURCE_INSTANCE/extra-addons/$MODULE"
-
-    if [[ -f "$first/__manifest__.py" ]]; then
-        SRC="$first"
-    elif [[ -f "$second/__manifest__.py" ]]; then
-        SRC="$second"
-    else
-        die "No se encontró el módulo en DEMO"
-    fi
-
-    VERSION=""
-    validate_source
-}
-
-prepare_backup() {
-    local stamp data_dir filestore home_dir
-
-    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-    BACKUP_DIR="$BACKUP_ROOT/$INSTANCE/${MODULE}_${stamp}"
-
-    install -d -m 700 "$BACKUP_DIR"
-
-    say "Respaldo: $BACKUP_DIR"
-
-    say "Respaldando PostgreSQL..."
-
-    sudo -u postgres pg_dump -Fc "$DB" \
-        > "$BACKUP_DIR/database.dump" ||
-        die "Fallo pg_dump"
-
-    [[ -s "$BACKUP_DIR/database.dump" ]] ||
-        die "Dump vacio"
-
-    pg_restore -l "$BACKUP_DIR/database.dump" \
-        >/dev/null ||
-        die "Dump PostgreSQL invalido"
-
-    data_dir="$(config_value data_dir)"
-
-    if [[ -n "$data_dir" ]]; then
-        filestore="$data_dir/filestore/$DB"
-    else
-        home_dir="$(getent passwd "$USERNAME" | cut -d: -f6)"
-        [[ -n "$home_dir" ]] ||
-            die "No se pudo identificar HOME de Odoo"
-
-        filestore="$home_dir/.local/share/Odoo/filestore/$DB"
-    fi
-
-    [[ -d "$filestore" ]] ||
-        die "Filestore inexistente: $filestore"
-
-    say "Respaldando filestore..."
-
-    tar -C "$(dirname "$filestore")" \
-        -czf "$BACKUP_DIR/filestore.tar.gz" \
-        "$(basename "$filestore")" ||
-        die "Fallo respaldo de filestore"
-
-    tar -tzf "$BACKUP_DIR/filestore.tar.gz" \
-        >/dev/null ||
-        die "Respaldo de filestore invalido"
-
-    say "Respaldando codigo del modulo..."
-
-    if [[ -d "$DEST" ]]; then
-        tar -C "$(dirname "$DEST")" \
-            -czf "$BACKUP_DIR/module.tar.gz" \
-            "$MODULE" ||
-            die "Fallo respaldo del codigo"
-
-        tar -tzf "$BACKUP_DIR/module.tar.gz" \
-            >/dev/null ||
-            die "Respaldo del codigo invalido"
-    else
-        echo "Modulo no existente previamente" \
-            > "$BACKUP_DIR/module_not_present.txt"
-    fi
-
-    {
-        printf 'instancia=%s\n' "$INSTANCE"
-        printf 'modulo=%s\n' "$MODULE"
-        printf 'database=%s\n' "$DB"
-        printf 'version_nueva=%s\n' "$VERSION"
-        printf 'version_previa=%s\n' "$INSTALLED_VERSION"
-        printf 'fecha_utc=%s\n' "$stamp"
-    } > "$BACKUP_DIR/metadata.txt"
-
-    (
-        cd "$BACKUP_DIR"
-
-        sha256sum database.dump \
-            filestore.tar.gz metadata.txt \
-            > SHA256SUMS
-
-        if [[ -f module.tar.gz ]]; then
-            sha256sum module.tar.gz >> SHA256SUMS
-        fi
-
-        sha256sum -c SHA256SUMS ||
-            exit 1
-    ) || die "Fallo verificacion SHA256 del respaldo"
-
-    say "RESPALDO COMPLETADO Y VERIFICADO"
-}
-
-execute_update() {
-    local op
-
-    if [[ "$ACTION" == "INSTALAR" ]]; then
-        op="-i"
-    else
-        op="-u"
-    fi
-
-    ODOO_LOG="$LOG_ROOT/${INSTANCE}_${MODULE}_odoo_$(date -u +%Y%m%dT%H%M%SZ).log"
-
-    install -o "$USERNAME" -g "$USERGROUP" \
-        -m 640 /dev/null "$ODOO_LOG"
-
-    say "Sincronizando codigo..."
-
-    # Desde este punto no se reinicia automaticamente
-    # ante un error, pues pueden existir cambios parciales.
-    CHANGES_STARTED=1
-
-    install -d \
-        -o "$USERNAME" \
-        -g "$USERGROUP" \
-        -m 755 "$DEST"
-
-    rsync -a --delete -- "$SRC/" "$DEST/" ||
-        die "Fallo rsync"
-
-    chown -R "$USERNAME:$USERGROUP" "$DEST" ||
-        die "No se pudieron asignar permisos"
-
-    say "Ejecutando Odoo ($op $MODULE)..."
-
-    sudo -u "$USERNAME" \
-        "$BASE/$INSTANCE/venv/bin/python" \
-        "$BASE/odoo/odoo-bin" \
-        -c "$CFG" \
-        -d "$DB" \
-        "$op" "$MODULE" \
-        --stop-after-init \
-        --no-http \
-        --logfile="$ODOO_LOG" ||
-        die "La ejecucion de Odoo fallo"
-
-    say "Iniciando servicio..."
-
-    systemctl start "$SERVICE" ||
-        die "No se pudo iniciar Odoo"
-
-    SERVICE_STOPPED=0
-
-    systemctl is-active --quiet "$SERVICE" ||
-        die "El servicio no esta activo"
-
-    local state
-
-    state="$(sudo -u postgres psql -X -At \
-        -v module="$MODULE" "$DB" <<'SQL'
-SELECT COALESCE(
-    (SELECT state
-     FROM ir_module_module
-     WHERE name = :'module'
-     LIMIT 1),
-    'missing'
-);
-SQL
-)" || die "No se pudo verificar la base de datos"
-
-    [[ "$state" == installed ]] ||
-        die "Estado final inesperado: $state"
-
-    say ""
-    say "=========================================="
-    say "         OPERACION COMPLETADA"
-    say "=========================================="
-    say "Instancia: $INSTANCE"
-    say "Modulo: $MODULE"
-    say "Version: $VERSION"
-    say "Estado: $state"
-    say "Log: $LOG"
-    say "Log Odoo: $ODOO_LOG"
-
-    if [[ -n "$BACKUP_DIR" ]]; then
-        say "Respaldo: $BACKUP_DIR"
-    fi
-}
-
-main() {
-    local backup_answer
-    local stamp
-
-    [[ $EUID -eq 0 ]] ||
-        die "Ejecuta con sudo"
-
-    check_dependencies
-
-    say "=========================================="
-    say "       ICKAB MODULE MANAGER"
-    say "             v$VERSION_MANAGER"
-    say "=========================================="
-    say ""
-
-    ask_name "¿Que instancia deseas actualizar?"
-    INSTANCE="$REPLY"
-
-    ask_name "¿Que modulo deseas instalar o actualizar?"
-    MODULE="$REPLY"
-
-    say ""
-    say "Origen del modulo:"
-    say "1) Local (DEMO)"
-    say "2) GitHub"
-
-    while true; do
-        read -r -p "Selecciona 1 o 2: " MODE ||
-            die "Entrada interrumpida"
-
-        [[ "$MODE" == 1 || "$MODE" == 2 ]] && break
-
-        say "Opcion no valida"
-    done
-
-    [[ -d "$BASE/$INSTANCE" ]] ||
-        die "Instancia inexistente"
-
-    CFG="$BASE/$INSTANCE/config/odoo18.conf"
-
-    [[ -f "$CFG" ]] ||
-        die "Configuracion inexistente"
-
-    check_service
-    check_paths
-    detect_database
-
-    install -d -m 700 "$BACKUP_ROOT"
-    install -d -m 750 -o root -g "$USERGROUP" "$LOG_ROOT"
-
-    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-    LOG="$LOG_ROOT/${INSTANCE}_${MODULE}_${stamp}.log"
-
-    exec > >(tee -a "$LOG") 2>&1
-
-    exec {LOCK_FD}>"/run/lock/ick_update_${INSTANCE}.lock"
-
-    flock -n "$LOCK_FD" ||
-        die "Ya existe una operacion para esta instancia"
-
-    WORK="$(mktemp -d /tmp/ickab-module.XXXXXXXX)"
-
-    if [[ "$MODE" == 2 ]]; then
-        github_download
-    else
-        local_source
-    fi
-
-    get_module_state
-
-    DISK_VERSION="No existe"
-
-    if [[ -f "$DEST/__manifest__.py" ]]; then
-        DISK_VERSION="$(
-            manifest_version "$DEST/__manifest__.py"
-        )"
-    fi
-
-    compare_versions ||
-        die "Version no permitida"
-
-    [[ "$(realpath -m "$SRC")" != "$(realpath -m "$DEST")" ]] ||
-        die "Origen y destino no pueden ser iguales"
-
-    say ""
-    say "=========================================="
-    say "          RESUMEN DE OPERACION"
-    say "=========================================="
-    say "Instancia:          $INSTANCE"
-    say "Base de datos:      $DB"
-    say "Modulo:             $MODULE"
-    say "Accion:             $ACTION"
-    say "Version instalada:  ${INSTALLED_VERSION:-No registrada}"
-    say "Version en disco:   $DISK_VERSION"
-    say "Version nueva:      $VERSION"
-    say "Destino:            $DEST"
-
-    if [[ "$MODE" == 2 ]]; then
-        say "Origen:             GitHub"
-    else
-        say "Origen:             DEMO"
-    fi
-
-    say ""
-    say "Archivos que se modificaran:"
-
-    rsync -ani --delete -- "$SRC/" "$DEST/" ||
-        die "No se pudo generar simulacion"
-
-    say ""
-    ask_sn "¿Deseas generar respaldo?"
-    backup_answer="$REPLY"
-
-    say ""
-    say "=========================================="
-    say "          CONFIRMACION FINAL"
-    say "=========================================="
-    say "Instancia: $INSTANCE"
-    say "Modulo: $MODULE"
-    say "Operacion: $ACTION"
-    say "Version: $VERSION"
-    say "Respaldo: $backup_answer"
-
-    if [[ "$backup_answer" == N ]]; then
-        say ""
-        say "ADVERTENCIA: No se generara respaldo nuevo."
-    fi
-
-    say ""
-    ask_sn "¿Confirmas la actualizacion?"
-
-    if [[ "$REPLY" == N ]]; then
-        say "Operacion cancelada sin modificar Odoo."
-        return 0
-    fi
-
-    say ""
-    say "Deteniendo servicio $SERVICE..."
-
+done < <(
+    systemctl list-unit-files --type=service --no-legend --no-pager |
+    awk '{print $1}' | sort -u
+)
+
+if ((${#SHARED[@]})); then
+    echo
+    echo "ADVERTENCIA: CODIGO COMPARTIDO CON:"
+    printf ' - %s\n' "${SHARED[@]}"
+    confirm "Autorizas modificar codigo compartido?"
+fi
+
+DATA=$(conf "$CFG" data_dir)
+
+if [[ -z "$DATA" ]]; then
+    HOMEOWNER=$(getent passwd "$OWNER" | cut -d: -f6)
+    DATA="$HOMEOWNER/.local/share/Odoo"
+fi
+
+FILESTORE="$DATA/filestore/$DB"
+[[ -d "$FILESTORE" ]] ||
+    die "No existe filestore: $FILESTORE"
+
+WAS_ACTIVE=0
+[[ "$STATE" == active ]] && WAS_ACTIVE=1
+
+echo
+echo "=========================================================="
+echo "                RESUMEN DE OPERACION"
+echo "=========================================================="
+echo "Servicio:       $SERVICE"
+echo "Base de datos:  $DB"
+echo "Odoo:           $VER"
+echo "Modulo:         $MODULE"
+echo "Operacion:      $ACTION"
+echo "Version actual: $OLDVER"
+echo "Version nueva:  $NEW"
+echo "Destino:        $DEST"
+echo "Estado inicial: $STATE"
+echo "Respaldo:       OBLIGATORIO"
+echo "=========================================================="
+echo
+
+confirm "Autorizas respaldo e instalacion/actualizacion?"
+
+mkdir -p "$ROOT"
+
+exec {LOCK}>"/run/lock/ickab-${SERVICE%.service}.lock"
+flock -n "$LOCK" || die "Existe otra operacion en curso"
+
+BACKUP="$ROOT/${SERVICE%.service}/${DB}/${MODULE}_$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$BACKUP"
+
+if ((WAS_ACTIVE)); then
     systemctl stop "$SERVICE" ||
         die "No se pudo detener el servicio"
+    STOPPED=1
+fi
 
-    SERVICE_STOPPED=1
+echo "Respaldando PostgreSQL..."
 
-    if [[ "$backup_answer" == S ]]; then
-        prepare_backup
-    else
-        say "Continuando sin respaldo nuevo."
+runuser -u "$OWNER" -- env PGPASSWORD="$PGPASSWORD" \
+    pg_dump -Fc "${PG[@]}" -d "$DB" \
+    > "$BACKUP/database.dump" ||
+    die "Fallo el respaldo PostgreSQL"
+
+[[ -s "$BACKUP/database.dump" ]] ||
+    die "El respaldo PostgreSQL esta vacio"
+
+echo "Respaldando filestore..."
+
+tar -C "$(dirname "$FILESTORE")" \
+    -czf "$BACKUP/filestore.tar.gz" \
+    "$(basename "$FILESTORE")" ||
+    die "Fallo el respaldo filestore"
+
+if [[ "$ACTION" == update ]]; then
+    echo "Respaldando codigo..."
+
+    tar -C "$(dirname "$DEST")" \
+        -czf "$BACKUP/code.tar.gz" "$MODULE" ||
+        die "Fallo el respaldo del modulo"
+fi
+
+(
+    cd "$BACKUP"
+    sha256sum database.dump filestore.tar.gz \
+        > SHA256SUMS
+    if [[ -f code.tar.gz ]]; then
+        sha256sum code.tar.gz >> SHA256SUMS
     fi
+)
 
-    execute_update
-}
+STAGE=$(mktemp -d "$(dirname "$DEST")/.ickab-${MODULE}.XXXXXXXX")
 
-main "$@"
+cp -a "$SOURCE/." "$STAGE/" ||
+    die "No se pudo preparar el codigo"
+
+chown -R "$OWNER:$(id -gn "$OWNER")" "$STAGE"
+
+PREVIOUS=""
+
+if [[ "$ACTION" == update ]]; then
+    PREVIOUS="$(dirname "$DEST")/.ickab-${MODULE}.previous-$$"
+    mv "$DEST" "$PREVIOUS" ||
+        die "No se pudo retirar el codigo anterior"
+fi
+
+if ! mv "$STAGE" "$DEST"; then
+    [[ -z "$PREVIOUS" ]] || mv "$PREVIOUS" "$DEST"
+    die "No se pudo instalar el nuevo codigo"
+fi
+
+FLAG="-i"
+[[ "$ACTION" == update ]] && FLAG="-u"
+
+printf '%s %s %s %s %s %s -> %s\n' \
+    "$(date -u +%FT%TZ)" \
+    "$SERVICE" "$DB" "$MODULE" "$ACTION" "$OLDVER" "$NEW" \
+    > "$BACKUP/operation.log"
+
+echo "Ejecutando Odoo..."
+
+if ! runuser -u "$OWNER" -- \
+    "$PY" "$BIN" \
+    -c "$CFG" \
+    -d "$DB" \
+    "$FLAG" "$MODULE" \
+    --stop-after-init \
+    --no-http \
+    --workers=0 \
+    --max-cron-threads=0 \
+    > "$BACKUP/odoo.log" 2>&1; then
+
+    echo "ERROR: Odoo no completo la operacion." |
+        tee -a "$BACKUP/operation.log"
+
+    die "Consultar $BACKUP/odoo.log. No restaurar BD automaticamente."
+fi
+
+FINALSTATE=$(
+    runuser -u "$OWNER" -- env PGPASSWORD="$PGPASSWORD" \
+        psql -X "${PG[@]}" -d "$DB" -Atqc \
+        "SELECT state FROM ir_module_module
+         WHERE name='$MODULE' LIMIT 1" 2>/dev/null || true
+)
+
+[[ "$FINALSTATE" == installed ]] ||
+    die "Estado final inesperado: $FINALSTATE"
+
+if ((WAS_ACTIVE)); then
+    systemctl start "$SERVICE" ||
+        die "No se pudo iniciar el servicio"
+
+    systemctl is-active --quiet "$SERVICE" ||
+        die "El servicio no quedo activo"
+
+    STOPPED=0
+fi
+
+if [[ -n "$PREVIOUS" ]]; then
+    mv "$PREVIOUS" "$BACKUP/previous-code"
+fi
+
+echo "OK" >> "$BACKUP/operation.log"
+
+echo
+echo "=========================================================="
+echo "                  OPERACION COMPLETADA"
+echo "=========================================================="
+echo "Servicio: $SERVICE"
+echo "Base:     $DB"
+echo "Modulo:   $MODULE"
+echo "Version:  $NEW"
+echo "Respaldo: $BACKUP"
+echo "=========================================================="
